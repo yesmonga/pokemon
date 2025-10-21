@@ -51,7 +51,7 @@ def fetch_messages(channel_id):
                 print(f"[{channel_id}] ❌ Erreur {response.status_code}: {response.text}")
         except Exception as e:
             print(f"[{channel_id}] ⚠️ Erreur dans fetch_messages: {e}")
-        time.sleep(1)
+        time.sleep(2)
 
 def is_allowed(msg):
     content = msg.get("content", "").lower()
