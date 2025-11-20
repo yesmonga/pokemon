@@ -3,24 +3,19 @@ import time
 import os
 import threading
 from flask import Flask
+from collections import defaultdict
+import re
 
 # Variables d’environnement
 USER_TOKEN = os.environ.get("USER_TOKEN")
 SOURCE_CHANNEL_IDS = os.environ.get("SOURCE_CHANNEL_IDS").split(",")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-ALLOWED_KEYWORDS = [
-    word.strip().lower()
-    for word in os.environ.get("ALLOWED_KEYWORDS", "").split(",")
-    if word.strip()
-]
-ALLOWED_SHOPS = [
-    shop.strip().lower()
-    for shop in os.environ.get("ALLOWED_SHOPS", "").split(",")
-    if shop.strip()
-]
 
 # Dernier message traité par channel
 last_message_ids = {channel_id: None for channel_id in SOURCE_CHANNEL_IDS}
+
+# Tracking des checkouts par produit
+product_checkouts = defaultdict(list)
 
 # Headers API Discord
 headers = {
@@ -29,8 +24,67 @@ headers = {
     "Content-Type": "application/json"
 }
 
+def parse_checkout(msg):
+    content = msg.get("content", "")
+    if not content:
+        return None
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    if not lines:
+        return None
+    
+    # Headers ou noms users à ignorer pour le titre
+    ignore_patterns = [
+        r"^\w+.*à \d+:\d+$",  # Nom user + timestamp
+        r"^Successful Checkout$",
+        r"^PanAIO User Checkout$",
+        r"^Checkout Ready.*$",
+        r"^APP — \d+:\d+$",
+        r"^LE KLAN.*$"
+    ]
+    
+    title = None
+    for line in lines:
+        if not any(re.match(pattern, line) for pattern in ignore_patterns):
+            if len(line) > 10 and not line.startswith(("Store:", "Site:", "Price:", "Mode:", "Payment")):  # Ligne potentiellement titre produit
+                title = line
+                break
+    
+    if not title:
+        title = lines[0] if lines else ""
+    
+    url = None
+    urls = re.findall(r'https?://[^\s<>"]+', content)
+    if urls:
+        url = urls[0]  # Prendre la première URL trouvée
+    else:
+        # Fallback pour 'Query'
+        for line in lines:
+            if line.startswith("Query"):
+                parts = line.split(" ", 1)
+                if len(parts) > 1:
+                    url = parts[1]
+                    break
+    
+    has_quicktask = False
+    quicktask_patterns = [
+        "Click to start quick task",
+        "Start Quicktask",
+        "Quicktask",
+        "Start quicktask",
+        "Click Here"
+    ]
+    for pattern in quicktask_patterns:
+        if pattern in content:
+            has_quicktask = True
+            break
+    
+    # Valide si titre significatif
+    if len(title.strip()) > 5:
+        return (title.lower().strip(), url, has_quicktask)
+    return None
+
 def fetch_messages(channel_id):
-    global last_message_ids
+    global last_message_ids, product_checkouts
     while True:
         try:
             url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=5"
@@ -42,41 +96,23 @@ def fetch_messages(channel_id):
 
                 for msg in messages:
                     if last_message_ids[channel_id] is None or msg["id"] > last_message_ids[channel_id]:
-                        if is_allowed(msg):
-                            send_as_yora_webhook(msg)
-                        else:
-                            print(f"[{channel_id}] 🔕 Message ignoré (aucun mot autorisé ou shop non trouvé).")
+                        parsed = parse_checkout(msg)
+                        if parsed:
+                            title, url, has_quicktask = parsed
+                            now = time.time()
+                            product_checkouts[title].append((now, msg["id"], url, has_quicktask))
+                            # Nettoyer les entrées anciennes
+                            product_checkouts[title] = [entry for entry in product_checkouts[title] if now - entry[0] <= 20]
+                            if len(product_checkouts[title]) >= 5:
+                                send_popular_notification(title, product_checkouts[title].copy())
+                                # Vider pour éviter spam immédiat
+                                product_checkouts[title] = []
                         last_message_ids[channel_id] = msg["id"]
             else:
                 print(f"[{channel_id}] ❌ Erreur {response.status_code}: {response.text}")
         except Exception as e:
             print(f"[{channel_id}] ⚠️ Erreur dans fetch_messages: {e}")
         time.sleep(2)
-
-def is_allowed(msg):
-    content = msg.get("content", "").lower()
-    # Vérifie le texte brut
-    keyword_found = any(keyword in content for keyword in ALLOWED_KEYWORDS)
-    shop_found = any(shop in content for shop in ALLOWED_SHOPS)
-    # Vérifie les embeds
-    for embed in msg.get("embeds", []):
-        fields_to_check = [
-            embed.get("title", ""),
-            embed.get("description", ""),
-            embed.get("footer", {}).get("text", "")
-        ]
-        if "fields" in embed:
-            fields_to_check += [f.get("name", "") + " " + f.get("value", "") for f in embed["fields"]]
-        for field in fields_to_check:
-            field_lower = field.lower()
-            if not keyword_found:
-                keyword_found = any(keyword in field_lower for keyword in ALLOWED_KEYWORDS)
-            if not shop_found:
-                shop_found = any(shop in field_lower for shop in ALLOWED_SHOPS)
-    if keyword_found and shop_found:
-        print("✅ Mot-clé et shop trouvés, message autorisé.")
-        return True
-    return False
 
 def send_as_yora_webhook(msg):
     content = msg.get("content", "")
@@ -95,6 +131,37 @@ def send_as_yora_webhook(msg):
     for att in attachments:
         payload["content"] += f"\n📎 {att['url']}"
     requests.post(WEBHOOK_URL, json=payload)
+
+def send_popular_notification(title, checkouts):
+    unique_urls = list(set(entry[2] for entry in checkouts if entry[2]))
+    has_qt = any(entry[3] for entry in checkouts)
+    content = f"🚀 Produit populaire détecté : {title}\nNombre de checkouts dans les 20 dernières secondes : {len(checkouts)}"
+    if has_qt:
+        content += "\n🔧 Quicktask disponible"
+    
+    embeds = []
+    if unique_urls:
+        embed = {
+            "title": "Liens des produits",
+            "color": int("9c73cb", 16),
+            "fields": [{"name": "URLs", "value": "\n".join(unique_urls[:5]), "inline": False}]
+        }
+        embeds.append(embed)
+    elif has_qt:
+        embed = {
+            "title": "Détails Quicktask",
+            "color": int("9c73cb", 16),
+            "description": "Quicktask disponible pour ce produit populaire",
+            "fields": []
+        }
+        embeds.append(embed)
+    
+    payload = {"content": content, "embeds": embeds}
+    response = requests.post(WEBHOOK_URL, json=payload)
+    if response.status_code == 204:
+        print(f"✅ Notification populaire envoyée pour {title}")
+    else:
+        print(f"❌ Erreur envoi notification : {response.status_code}")
 
 # Serveur Railway / UptimeRobot
 app = Flask(__name__)
